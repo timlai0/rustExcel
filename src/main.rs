@@ -168,6 +168,7 @@ struct Queue {
 
 struct Loader {
     queue: Arc<Queue>,
+    active: Arc<Mutex<Vec<(usize, Instant)>>>,
     rx: Receiver<(usize, Result<Book, String>)>,
 }
 
@@ -179,10 +180,11 @@ impl Loader {
             claimed: (0..n).map(|_| AtomicBool::new(false)).collect(),
         });
         let (tx, rx) = channel();
+        let active: Arc<Mutex<Vec<(usize, Instant)>>> = Arc::default();
         let paths = Arc::new(paths);
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 8);
         for _ in 0..threads {
-            let (queue, tx, paths, ctx) = (queue.clone(), tx.clone(), paths.clone(), ctx.clone());
+            let (queue, tx, paths, ctx, active) = (queue.clone(), tx.clone(), paths.clone(), ctx.clone(), active.clone());
             std::thread::spawn(move || loop {
                 let idx = {
                     let mut g = queue.q.lock().unwrap();
@@ -197,14 +199,16 @@ impl Loader {
                 if queue.claimed[idx].swap(true, Ordering::SeqCst) {
                     continue;
                 }
+                active.lock().unwrap().push((idx, Instant::now()));
                 let r = load_book(&paths[idx]);
+                active.lock().unwrap().retain(|a| a.0 != idx);
                 if tx.send((idx, r)).is_err() {
                     return;
                 }
                 ctx.request_repaint();
             });
         }
-        Loader { queue, rx }
+        Loader { queue, active, rx }
     }
 
     fn prioritize(&self, idx: usize) {
@@ -365,6 +369,7 @@ struct App {
     pal_open: bool,
     pal_query: String,
     pal_sel: usize,
+    vertical_wbs: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -388,6 +393,7 @@ enum Cmd {
     GotoWb(usize),
     GotoSheet(usize),
     ToggleTheme,
+    ToggleVerticalWbs,
 }
 
 fn fuzzy(hay: &str, q: &str) -> Option<usize> {
@@ -464,6 +470,7 @@ impl App {
             pal_open: false,
             pal_query: String::new(),
             pal_sel: 0,
+            vertical_wbs: false,
         }
     }
 
@@ -527,6 +534,15 @@ impl App {
             self.loader = None;
         }
         let _ = ctx;
+    }
+
+    /// Files currently being parsed, with elapsed seconds (longest-running first).
+    fn loading_now(&self) -> Vec<(String, f32)> {
+        let Some(l) = &self.loader else { return Vec::new() };
+        let mut v: Vec<(String, f32)> =
+            l.active.lock().unwrap().iter().map(|(i, t)| (self.wbs[*i].name.clone(), t.elapsed().as_secs_f32())).collect();
+        v.sort_by(|a, b| b.1.total_cmp(&a.1));
+        v
     }
 
     fn select_wb(&mut self, wi: usize) {
@@ -699,6 +715,7 @@ impl App {
             ("Next folder".into(), Cmd::NextFolder),
             ("Previous folder".into(), Cmd::PrevFolder),
             ("Toggle light/dark theme".into(), Cmd::ToggleTheme),
+            ("Toggle vertical workbook list".into(), Cmd::ToggleVerticalWbs),
         ]);
         if let Some(wi) = self.sel_wb {
             if let State::Ready(b) = &self.wbs[wi].state {
@@ -779,6 +796,7 @@ impl App {
                     self.sel = None;
                 }
             }
+            Cmd::ToggleVerticalWbs => self.vertical_wbs = !self.vertical_wbs,
             Cmd::ToggleTheme => {
                 let dark = ctx.style().visuals.dark_mode;
                 ctx.set_visuals(if dark { egui::Visuals::light() } else { egui::Visuals::dark() });
@@ -953,6 +971,8 @@ impl App {
                     ui.label(format!("{}/{}{} {}", cur, n, cap, if self.search_done { "" } else { "…" }));
                     ui.toggle_value(&mut self.show_results, "Results list");
                 }
+                ui.separator();
+                ui.toggle_value(&mut self.vertical_wbs, "Vertical workbooks").on_hover_text("Show workbooks as a vertical list on the left");
             });
             ui.separator();
 
@@ -964,28 +984,18 @@ impl App {
                     }
                 }
             });
-            // row 2: workbooks of the selected folder
-            tab_row(ui, "Workbooks", "r2", 66.0, |ui| {
-                if let Some(g) = self.groups.get(self.sel_group) {
-                    for &wi in &g.wbs {
-                        let wb = &self.wbs[wi];
-                        let mark = match wb.state {
-                            State::Pending => " …",
-                            State::Failed(_) => " !",
-                            State::Ready(_) => "",
-                        };
-                        let r = ui.selectable_label(self.sel_wb == Some(wi), format!("{}{}", wb.name, mark));
-                        if let State::Failed(e) = &wb.state {
-                            r.clone().on_hover_text(e);
-                        } else {
-                            r.clone().on_hover_text(wb.path.to_string_lossy());
-                        }
-                        if r.clicked() {
-                            pick_wb = Some(wi);
+            // row 2: workbooks of the selected folder (horizontal mode only)
+            if !self.vertical_wbs {
+                tab_row(ui, "Workbooks", "r2", 66.0, |ui| {
+                    if let Some(g) = self.groups.get(self.sel_group) {
+                        for &wi in &g.wbs {
+                            if wb_label(ui, &self.wbs[wi], self.sel_wb == Some(wi)) {
+                                pick_wb = Some(wi);
+                            }
                         }
                     }
-                }
-            });
+                });
+            }
             // row 3: sheets of the selected workbook
             tab_row(ui, "Sheets", "r3", 46.0, |ui| {
                 if let Some(wi) = self.sel_wb {
@@ -1021,11 +1031,43 @@ impl App {
         }
     }
 
+    fn ui_wb_side(&mut self, ctx: &egui::Context) {
+        if !self.vertical_wbs {
+            return;
+        }
+        let mut pick = None;
+        egui::SidePanel::left("wb_list").resizable(true).default_width(240.0).show(ctx, |ui| {
+            ui.label(egui::RichText::new("Workbooks").weak());
+            ui.separator();
+            ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+                if let Some(g) = self.groups.get(self.sel_group) {
+                    for &wi in &g.wbs {
+                        if wb_label(ui, &self.wbs[wi], self.sel_wb == Some(wi)) {
+                            pick = Some(wi);
+                        }
+                    }
+                }
+            });
+        });
+        if let Some(w) = pick {
+            self.select_wb(w);
+        }
+    }
+
     fn ui_status(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let total = self.wbs.len();
                 ui.label(format!("{} workbooks, {}/{} loaded", total, self.loaded.min(total), total));
+                let busy = self.loading_now();
+                if !busy.is_empty() {
+                    ui.add(egui::ProgressBar::new(self.loaded as f32 / total.max(1) as f32).desired_width(100.0));
+                    let mut t: Vec<String> = busy.iter().take(3).map(|(n, s)| format!("{} ({:.1}s)", n, s)).collect();
+                    if busy.len() > 3 {
+                        t.push(format!("+{} more", busy.len() - 3));
+                    }
+                    ui.add(egui::Label::new(format!("Parsing: {}", t.join(", "))).truncate());
+                }
                 if let Some((wi, si)) = self.cur_sheet_id() {
                     let b = self.book(wi).unwrap();
                     let s = &b.sheets[si];
@@ -1074,6 +1116,7 @@ impl App {
     }
 
     fn ui_central(&mut self, ctx: &egui::Context) {
+        let busy = self.loading_now();
         egui::CentralPanel::default().show(ctx, |ui| {
             let Some(wi) = self.sel_wb else {
                 ui.centered_and_justified(|ui| {
@@ -1083,10 +1126,30 @@ impl App {
             };
             if let Some(l) = &self.loader {
                 l.prioritize(wi);
+                ctx.request_repaint_after(Duration::from_millis(150));
             }
             match &self.wbs[wi].state {
                 State::Pending => {
-                    ui.centered_and_justified(|ui| ui.spinner());
+                    let name = self.wbs[wi].name.clone();
+                    let mine = busy.iter().find(|b| b.0 == name).map(|b| b.1);
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(ui.available_height() / 3.0);
+                        ui.spinner();
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new(&name).strong());
+                        match mine {
+                            Some(s) => ui.label(format!("Parsing… {:.1}s", s)),
+                            None => ui.label("Queued — will start as soon as a worker is free"),
+                        };
+                        ui.label(format!("{}/{} workbooks loaded", self.loaded, self.wbs.len()));
+                        if !busy.is_empty() {
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new("Currently parsing:").weak());
+                            for (n, s) in busy.iter().take(8) {
+                                ui.label(format!("{} ({:.1}s)", n, s));
+                            }
+                        }
+                    });
                 }
                 State::Failed(e) => {
                     ui.label(format!("Could not open {}: {}", self.wbs[wi].name, e));
@@ -1227,6 +1290,21 @@ fn rn_width(sheet: &Sheet) -> f32 {
     (sheet.row0 + sheet.nrows).to_string().len() as f32 * 8.0 + 18.0
 }
 
+fn wb_label(ui: &mut egui::Ui, wb: &Wb, selected: bool) -> bool {
+    let mark = match wb.state {
+        State::Pending => " …",
+        State::Failed(_) => " !",
+        State::Ready(_) => "",
+    };
+    let r = ui.selectable_label(selected, format!("{}{}", wb.name, mark));
+    if let State::Failed(e) = &wb.state {
+        r.clone().on_hover_text(e);
+    } else {
+        r.clone().on_hover_text(wb.path.to_string_lossy());
+    }
+    r.clicked()
+}
+
 fn tab_row(ui: &mut egui::Ui, title: &str, id: &str, max_h: f32, add: impl FnOnce(&mut egui::Ui)) {
     ui.horizontal_top(|ui| {
         ui.add_sized([70.0, 18.0], egui::Label::new(egui::RichText::new(title).weak()));
@@ -1247,6 +1325,7 @@ impl eframe::App for App {
         self.ui_palette(ctx);
         self.ui_status(ctx);
         self.ui_results(ctx);
+        self.ui_wb_side(ctx);
         self.ui_central(ctx);
     }
 }
